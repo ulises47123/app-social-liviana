@@ -1,0 +1,8 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Monograma propio: una F y una X juntas -->
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M31,30h30v9H41v10h16v9H41v20H31z" />
+    <path android:strokeColor="#FFFFD54F" android:strokeWidth="8" android:strokeLineCap="round"
+        android:pathData="M55,52L75,76M75,52L55,76" />
+</vector>
