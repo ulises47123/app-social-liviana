@@ -24,6 +24,7 @@ import java.util.regex.Pattern;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.view.Gravity;
@@ -34,6 +35,7 @@ import android.webkit.RenderProcessGoneDetail;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -49,8 +51,9 @@ import android.widget.Toast;
 public class MainActivity extends Activity {
 
     private static final String INICIO = "https://m.facebook.com/";
-    private static final String MENSAJES = "https://m.facebook.com/messages/";
     private static final int PEDIDO_ARCHIVO = 10;
+    /** Apps de mensajes de Facebook, en orden de preferencia (la Lite gasta menos memoria). */
+    private static final String[] APPS_MENSAJES = {"com.facebook.mlite", "com.facebook.orca"};
 
     private FrameLayout raiz;
     private WebView web;
@@ -61,6 +64,15 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     /** Fotos/videos recibidos desde la galería, esperando a que Facebook pida un archivo. */
     private Uri[] pendientes;
+    /** Página a la que se vuelve con "Reintentar" cuando no hubo conexión. */
+    private String ultimaFallida;
+    /** El JavaScript de ayuda ya se inyectó en la página actual. */
+    private boolean puenteListo;
+    /** Los chats se están viendo con la versión de computadora de Facebook, dentro de la app. */
+    private boolean chatWeb;
+    private String agenteCelular;
+    /** Al salir de los chats se borra el historial, para que Atrás no vuelva a meterse en ellos. */
+    private boolean borrarHistorial;
 
     /** Hace que el botón "Compartir" de Facebook abra el menú de Android (WhatsApp, etc.). */
     private static final String PUENTE_JS = "(function(){if(window.__sl)return;window.__sl=1;"
@@ -72,28 +84,43 @@ public class MainActivity extends Activity {
             + "if(!vp){vp=document.createElement('meta');vp.name='viewport';(document.head||document.documentElement).appendChild(vp);}"
             + "vp.content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no';"
             // Oculta el cartel "Abrir app" (y variantes), también cuando Facebook lo vuelve a poner.
-            + "var T=['abrir app','abrir la app','abrir aplicación','abrir la aplicación','abrir en la app',"
+            // Se recorren solo los textos cortos: con XPath cada pasada tardaba más de un segundo en la página de chats.
+            + "var T={};['abrir app','abrir la app','abrir aplicación','abrir la aplicación','abrir en la app',"
             + "'usar la app','obtener la app','descargar la app','descarga la app','descargar facebook','descarga facebook',"
             + "'instalar la app','instalar facebook','instala la app','open app','open in app','get the app','use app',"
-            + "'este navegador no es compatible'];"
-            + "var X=\"//*[not(self::script)][text()[\"+T.map(function(t){return \"normalize-space(translate(.,"
-            + "'ABCDEFGHIJKLMNOPQRSTUVWXYZÁ','abcdefghijklmnopqrstuvwxyzá'))='\"+t+\"'\";}).join(' or ')+\"]]\";"
-            + "function ocultar(){try{var r=document.evaluate(X,document.body,null,7,null);"
-            + "for(var i=0;i<r.snapshotLength;i++){var e=r.snapshotItem(i),n=e,ok=false;"
+            + "'este navegador no es compatible'].forEach(function(t){T[t]=1;});"
+            + "function ocultar(){try{if(!document.body)return;var w=document.createTreeWalker(document.body,4,null),x;"
+            + "while(x=w.nextNode()){var v=x.nodeValue;if(v.length<7||v.length>60)continue;"
+            + "if(!T[v.replace(/\\s+/g,' ').trim().toLowerCase()])continue;"
+            + "var e=x.parentElement;if(!e||e.tagName==='SCRIPT'||e.tagName==='STYLE')continue;var n=e,ok=false;"
             + "for(var k=0;k<12&&n&&n!==document.body;k++){var p=getComputedStyle(n).position;"
             + "if(p==='fixed'||p==='sticky'){n.style.setProperty('display','none','important');ok=true;break;}n=n.parentElement;}"
             + "if(!ok){var b=e.closest('a,button,[role=button]')||e;b.style.setProperty('display','none','important');}}}catch(x){}}"
-            + "ocultar();new MutationObserver(function(){if(!window.__slt)window.__slt=setTimeout(function(){window.__slt=0;ocultar();},250);})"
+            + "ocultar();new MutationObserver(function(){if(!window.__slt)window.__slt=setTimeout(function(){window.__slt=0;if(!document.hidden)ocultar();},1000);})"
             + ".observe(document.documentElement,{childList:true,subtree:true});})();";
 
     @Override
     protected void onCreate(Bundle estado) {
         super.onCreate(estado);
         prefs = getSharedPreferences("ajustes", MODE_PRIVATE);
+        // Solo en la compilación de pruebas: permite inspeccionar la página desde la PC (chrome://inspect).
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            WebView.setWebContentsDebuggingEnabled(true);
+        }
 
         raiz = new FrameLayout(this);
         raiz.setBackgroundColor(Color.WHITE);
         setContentView(raiz);
+        if (Build.VERSION.SDK_INT >= 35) {
+            // Desde Android 15 la app se dibuja de borde a borde: se deja lugar para las barras y el teclado.
+            raiz.setBackgroundColor(0xFF1B5E9E);
+            raiz.setOnApplyWindowInsetsListener((v, insets) -> {
+                android.graphics.Insets b = insets.getInsets(
+                        android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.ime());
+                v.setPadding(b.left, b.top, b.right, b.bottom);
+                return insets;
+            });
+        }
 
         crearWeb();
 
@@ -104,13 +131,77 @@ public class MainActivity extends Activity {
         lpBarra.topMargin = -dp(1);
         raiz.addView(barra, lpBarra);
 
-        if (estado != null && web.restoreState(estado) != null) {
-            return;
+        if (estado != null) {
+            // Si Android cerró la app estando en los chats, se vuelve directo con la versión de computadora
+            // (antes cargaba primero la de celular y después recargaba todo).
+            if (estado.getBoolean("chat_web")) {
+                chatWeb = true;
+                web.getSettings().setUserAgentString(agenteEscritorio());
+            }
+            if (web.restoreState(estado) != null) return;
+            salirDeChatWeb();
         }
         if (!recibirCompartido(getIntent())) {
             String enlace = enlaceDe(getIntent());
-            web.loadUrl(enlace != null ? enlace : INICIO);
+            ir(enlace != null ? enlace : INICIO);
         }
+    }
+
+    /** Carga una dirección de Facebook. Los mensajes van aparte y lo que no es de Facebook se abre afuera. */
+    private void ir(String url) {
+        Uri u = Uri.parse(url);
+        boolean vacia = web.getUrl() == null;
+        if (!esDeFacebook(u)) {
+            abrirFuera(u);
+            if (vacia) web.loadUrl(INICIO);
+        } else if (esMensajes(u)) {
+            if (vacia) web.loadUrl(INICIO);
+            abrirMensajes();
+        } else {
+            salirDeChatWeb();
+            web.loadUrl(url);
+        }
+    }
+
+    private static boolean esMensajes(Uri u) {
+        String ruta = u.getPath() == null ? "" : u.getPath();
+        return ruta.equals("/messages") || ruta.startsWith("/messages/");
+    }
+
+    /**
+     * Facebook ya no deja chatear desde navegadores de celular ("Usa Messenger para seguir chateando"),
+     * así que los mensajes se abren en Messenger si está instalado.
+     */
+    private void abrirMensajes() {
+        if (prefs.getBoolean("mensajes_en_app", true)) { abrirChatWeb(); return; }
+        for (String paquete : APPS_MENSAJES) {
+            Intent i = getPackageManager().getLaunchIntentForPackage(paquete);
+            if (i != null) { startActivity(i); return; }
+        }
+        abrirChatWeb();   // no hay Messenger instalado
+    }
+
+    private static final String CHAT_WEB = "https://www.facebook.com/messages/t/";
+
+    /**
+     * Los chats sí funcionan en la versión de computadora de Facebook: se pide esa versión solo
+     * para los mensajes, y al salir de ahí se vuelve a la versión de celular, que es más liviana.
+     */
+    private void abrirChatWeb() {
+        chatWeb = true;
+        web.getSettings().setUserAgentString(agenteEscritorio());
+        web.loadUrl(CHAT_WEB);
+    }
+
+    private String agenteEscritorio() {
+        return agenteCelular.replaceAll("\\(Linux; Android[^)]*\\)", "(X11; Linux x86_64)").replace(" Mobile", "");
+    }
+
+    private void salirDeChatWeb() {
+        if (!chatWeb) return;
+        chatWeb = false;
+        borrarHistorial = true;
+        web.getSettings().setUserAgentString(agenteCelular);
     }
 
     // ---------- Recibir desde la galería u otras apps ----------
@@ -129,10 +220,15 @@ public class MainActivity extends Activity {
             Matcher m = URL_EN_TEXTO.matcher(texto);
             if (m.find()) {
                 // Diálogo oficial de Facebook para publicar un enlace.
+                salirDeChatWeb();
                 web.loadUrl("https://m.facebook.com/sharer.php?u=" + Uri.encode(m.group()));
+                // A veces Facebook abre la publicación sin mostrar el enlace: queda copiado para pegarlo.
+                copiar(m.group());
+                Toast.makeText(this, "Enlace copiado: si no aparece en la publicación, mantené apretado y pegalo",
+                        Toast.LENGTH_LONG).show();
             } else {
                 copiar(texto);
-                web.loadUrl(INICIO);
+                ir(INICIO);
                 Toast.makeText(this, "Texto copiado: mantené apretado y pegalo en tu publicación",
                         Toast.LENGTH_LONG).show();
             }
@@ -152,7 +248,7 @@ public class MainActivity extends Activity {
         if (lista.isEmpty()) return false;
 
         pendientes = lista.toArray(new Uri[0]);
-        web.loadUrl(INICIO);
+        ir(INICIO);
         new AlertDialog.Builder(this)
                 .setTitle(lista.size() == 1 ? "Foto lista para publicar" : lista.size() + " archivos listos para publicar")
                 .setMessage("Tocá \"Foto\" (arriba, junto a \"¿Qué estás pensando?\") y se adjunta sola. "
@@ -186,7 +282,9 @@ public class MainActivity extends Activity {
         s.setTextZoom(100);
         s.setBlockNetworkImage(prefs.getBoolean("sin_imagenes", false));
         // Sin la marca "wv" Facebook entrega la versión móvil completa, como en Chrome.
-        s.setUserAgentString(s.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", ""));
+        agenteCelular = s.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", "");
+        s.setUserAgentString(agenteCelular);
+        chatWeb = false;
 
         CookieManager cookies = CookieManager.getInstance();
         cookies.setAcceptCookie(true);
@@ -209,6 +307,11 @@ public class MainActivity extends Activity {
             if (texto != null && !texto.isEmpty() && !texto.equals(url)) sb.append(texto).append('\n');
             sb.append(url);
             runOnUiThread(() -> compartirTexto(sb.toString().trim()));
+        }
+
+        @JavascriptInterface
+        public void reintentar() {
+            runOnUiThread(MainActivity.this::reintentar);
         }
     }
 
@@ -267,7 +370,7 @@ public class MainActivity extends Activity {
                 .setItems(new String[]{"Compartir enlace (WhatsApp…)", "Copiar enlace", "Abrir"}, (d, cual) -> {
                     if (cual == 0) compartirTexto(enlace);
                     else if (cual == 1) { copiar(enlace); Toast.makeText(this, "Enlace copiado", Toast.LENGTH_SHORT).show(); }
-                    else web.loadUrl(enlace);
+                    else ir(enlace);
                 })
                 .show();
     }
@@ -355,7 +458,20 @@ public class MainActivity extends Activity {
                     String destino = u.getQueryParameter("u");
                     if (destino != null) { abrirFuera(Uri.parse(destino)); return true; }
                 }
-                if (esDeFacebook(u)) return false;   // se queda en la app
+                if (esDeFacebook(u)) {
+                    if (!pedido.isForMainFrame()) return false;
+                    if (esMensajes(u)) {
+                        if (chatWeb) return false;
+                        abrirMensajes();
+                        return true;
+                    }
+                    if (chatWeb) {   // salió de los chats: de vuelta a la versión de celular
+                        salirDeChatWeb();
+                        v.loadUrl(u.toString().replace("://www.facebook.com", "://m.facebook.com"));
+                        return true;
+                    }
+                    return false;   // se queda en la app
+                }
                 abrirFuera(u);
                 return true;
             }
@@ -376,12 +492,39 @@ public class MainActivity extends Activity {
         @Override
         public void onPageStarted(WebView v, String url, Bitmap icono) {
             barra.setVisibility(View.VISIBLE);
+            puenteListo = false;
+        }
+
+        /** También avisa de los cambios de página que Facebook hace sin recargar (el ícono de Messenger). */
+        @Override
+        public void doUpdateVisitedHistory(WebView v, String url, boolean recarga) {
+            if (url == null || !url.startsWith("http")) return;
+            Uri u = Uri.parse(url);
+            if (!esDeFacebook(u)) return;
+            if (chatWeb) {
+                // Dentro de los chats Facebook cambia de página sin recargar: si se fue a otra sección, se vuelve al celular.
+                if (!esMensajes(u) && !PAGINA_ERROR.equals(url)) {
+                    salirDeChatWeb();
+                    v.loadUrl(url.replace("://www.facebook.com", "://m.facebook.com"));
+                }
+            } else if (esMensajes(u)) {
+                abrirMensajes();
+            }
+        }
+
+        @Override
+        public void onReceivedError(WebView v, WebResourceRequest pedido, WebResourceError error) {
+            if (!pedido.isForMainFrame()) return;
+            ultimaFallida = pedido.getUrl().toString();
+            v.loadDataWithBaseURL(PAGINA_ERROR, HTML_ERROR, "text/html", "utf-8", null);
         }
 
         @Override
         public void onPageFinished(WebView v, String url) {
             barra.setVisibility(View.GONE);
-            v.evaluateJavascript(PUENTE_JS, null);
+            if (borrarHistorial && !chatWeb) { borrarHistorial = false; v.clearHistory(); }
+            if (PAGINA_ERROR.equals(url)) return;
+            inyectar(v);
             CookieManager.getInstance().flush();   // la sesión sobrevive aunque Android cierre la app
         }
 
@@ -394,6 +537,28 @@ public class MainActivity extends Activity {
             Toast.makeText(MainActivity.this, "Se recargó por falta de memoria", Toast.LENGTH_SHORT).show();
             return true;
         }
+    }
+
+    private void inyectar(WebView v) {
+        puenteListo = true;
+        v.evaluateJavascript(PUENTE_JS, null);
+    }
+
+    // ---------- Sin conexión ----------
+
+    private static final String PAGINA_ERROR = "https://sin-conexion.invalid/";
+    private static final String HTML_ERROR = "<!doctype html><meta charset=utf-8>"
+            + "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            + "<body style='font-family:sans-serif;text-align:center;padding:25vh 24px 0;color:#1c1e21'>"
+            + "<h2 style='margin:0 0 8px'>Sin conexión</h2>"
+            + "<p style='color:#65676b'>No se pudo cargar Facebook. Revisá el Wi-Fi o los datos.</p>"
+            + "<button onclick='SocialLiviano.reintentar()' style='margin-top:16px;padding:12px 28px;border:0;"
+            + "border-radius:8px;background:#1b5e9e;color:#fff;font-size:17px'>Reintentar</button></body>";
+
+    private void reintentar() {
+        String url = ultimaFallida != null ? ultimaFallida : INICIO;
+        ultimaFallida = null;
+        web.loadUrl(url);
     }
 
     private void abrirFuera(Uri u) {
@@ -414,7 +579,8 @@ public class MainActivity extends Activity {
         public void onProgressChanged(WebView v, int progreso) {
             barra.setProgress(progreso);
             barra.setVisibility(progreso < 100 ? View.VISIBLE : View.GONE);
-            if (progreso >= 30) v.evaluateJavascript(PUENTE_JS, null);
+            // Una sola vez por página: antes se mandaba el script entero en cada aviso de progreso.
+            if (progreso >= 30 && !puenteListo && !PAGINA_ERROR.equals(v.getUrl())) inyectar(v);
         }
 
         @Override
@@ -490,13 +656,23 @@ public class MainActivity extends Activity {
     private void descargar(String url, String agente, String disposicion, String tipo) {
         try {
             String nombre = URLUtil.guessFileName(url, disposicion, tipo);
+            if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                Toast.makeText(this, "Este archivo no se puede descargar desde acá", Toast.LENGTH_SHORT).show();
+                return;
+            }
             DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
             r.setMimeType(tipo);
-            r.addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url));
+            String cookies = CookieManager.getInstance().getCookie(url);
+            if (cookies != null) r.addRequestHeader("Cookie", cookies);
             r.addRequestHeader("User-Agent", agente);
             r.setTitle(nombre);
             r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-            r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, nombre);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, nombre);
+            } else {
+                // Hasta Android 9 la carpeta pública pide un permiso; esta no (Android/data/.../Download).
+                r.setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, nombre);
+            }
             ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
             Toast.makeText(this, "Descargando " + nombre, Toast.LENGTH_SHORT).show();
         } catch (Exception e) {
@@ -509,8 +685,19 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (vistaPantallaCompleta != null) { new Cromo().onHideCustomView(); return; }
+        if (PAGINA_ERROR.equals(web.getUrl())) { mostrarMenu(); return; }
+        // En la lista de chats, Atrás vuelve al inicio de celular en vez de recorrer el historial.
+        if (chatWeb && rutaDeChat(web.getUrl()).isEmpty()) { ir(INICIO); return; }
         if (web.canGoBack()) { web.goBack(); return; }
         mostrarMenu();
+    }
+
+    /** Lo que sigue a /messages/t/ en la dirección: vacío en la lista de chats, el id dentro de una conversación. */
+    private static String rutaDeChat(String url) {
+        if (url == null) return "";
+        String ruta = Uri.parse(url).getPath();
+        if (ruta == null) return "";
+        return ruta.replaceFirst("^/messages(/t)?/?", "").replaceAll("/+$", "");
     }
 
     private void mostrarMenu() {
@@ -521,15 +708,16 @@ public class MainActivity extends Activity {
                 "Recargar",
                 sinImagenes ? "Mostrar imágenes" : "Ahorrar datos (sin imágenes)",
                 "Compartir esta página",
+                prefs.getBoolean("mensajes_en_app", true) ? "Mensajes: abrir en Messenger" : "Mensajes: abrir dentro de Face",
                 "Salir"
         };
         new AlertDialog.Builder(this)
                 .setTitle(getString(R.string.app_name))
                 .setItems(opciones, (d, cual) -> {
                     switch (cual) {
-                        case 0: web.loadUrl(INICIO); break;
-                        case 1: web.loadUrl(MENSAJES); break;
-                        case 2: web.reload(); break;
+                        case 0: ir(INICIO); break;
+                        case 1: abrirMensajes(); break;
+                        case 2: if (PAGINA_ERROR.equals(web.getUrl())) reintentar(); else web.reload(); break;
                         case 3:
                             prefs.edit().putBoolean("sin_imagenes", !sinImagenes).apply();
                             web.getSettings().setBlockNetworkImage(!sinImagenes);
@@ -537,7 +725,13 @@ public class MainActivity extends Activity {
                             break;
                         case 4:
                             String url = web.getUrl();
-                            if (url != null) compartirTexto(limpiarEnlace(url));
+                            if (url != null && !PAGINA_ERROR.equals(url)) compartirTexto(limpiarEnlace(url));
+                            break;
+                        case 5:
+                            boolean enApp = !prefs.getBoolean("mensajes_en_app", true);
+                            prefs.edit().putBoolean("mensajes_en_app", enApp).apply();
+                            Toast.makeText(this, enApp ? "Los mensajes se abren dentro de Face"
+                                    : "Los mensajes se abren en Messenger", Toast.LENGTH_SHORT).show();
                             break;
                         default: finish();
                     }
@@ -560,13 +754,14 @@ public class MainActivity extends Activity {
         setIntent(i);   // mantiene el permiso de lectura de las fotos recibidas
         if (recibirCompartido(i)) return;
         String enlace = enlaceDe(i);
-        if (enlace != null) web.loadUrl(enlace);
+        if (enlace != null) ir(enlace);
     }
 
     @Override
     protected void onSaveInstanceState(Bundle estado) {
         super.onSaveInstanceState(estado);
         web.saveState(estado);
+        estado.putBoolean("chat_web", chatWeb);
     }
 
     @Override
@@ -583,6 +778,16 @@ public class MainActivity extends Activity {
         web.pauseTimers();
         CookieManager.getInstance().flush();
         super.onPause();
+    }
+
+    /** Cuando el celular se queda sin memoria se suelta lo que se puede volver a bajar. */
+    @Override
+    public void onTrimMemory(int nivel) {
+        super.onTrimMemory(nivel);
+        if (web != null && (nivel >= TRIM_MEMORY_COMPLETE
+                || nivel == TRIM_MEMORY_RUNNING_CRITICAL || nivel == TRIM_MEMORY_RUNNING_LOW)) {
+            web.clearCache(false);   // solo la caché en memoria; lo guardado en disco queda
+        }
     }
 
     @Override

@@ -3,6 +3,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Para saber si Messenger está instalado y abrirlo desde "Mensajes" -->
+    <queries>
+        <package android:name="com.facebook.orca" />
+        <package android:name="com.facebook.mlite" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"

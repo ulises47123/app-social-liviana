@@ -6,7 +6,11 @@ es un WebView que abre el sitio público.
 
 ## Funciones
 
-- Abre `m.facebook.com` y la sección de mensajes, con sesión guardada por las cookies del WebView.
+- Abre `m.facebook.com` con sesión guardada por las cookies del WebView.
+- Mensajes: Facebook bloquea los chats en navegadores de celular, así que se abren dentro de la app con la versión
+  de computadora (`www.facebook.com/messages`), y al salir se vuelve a la versión de celular. Desde el menú se puede
+  elegir abrirlos en Messenger.
+- Página propia de "Sin conexión" con botón Reintentar.
 - Oculta los carteles de "Abrir la app / Descargar la app".
 - Recibe fotos y videos compartidos desde la galería para publicarlos, y enlaces para compartir con el diálogo
   oficial `sharer.php`.
